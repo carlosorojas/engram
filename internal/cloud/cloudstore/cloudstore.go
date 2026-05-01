@@ -71,6 +71,13 @@ func (cs *CloudStore) SetDashboardAllowedProjects(projects []string) {
 		if project == "" {
 			continue
 		}
+		if project == "*" {
+			// Wildcard: leave the scope map empty so dashboard filtering is
+			// bypassed (empty scope == no filter at the query/read-model level).
+			cs.dashboardAllowedScopes = make(map[string]struct{})
+			cs.invalidateDashboardReadModel()
+			return
+		}
 		cs.dashboardAllowedScopes[project] = struct{}{}
 	}
 	cs.invalidateDashboardReadModel()

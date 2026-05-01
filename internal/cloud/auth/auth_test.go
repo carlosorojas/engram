@@ -141,6 +141,47 @@ func TestProjectScopeAuthorizerEnrolledProjects(t *testing.T) {
 	}
 }
 
+// TestWildcardAllowlist covers the `*` sentinel that authorizes every project.
+// Used by single-tenant / dev deployments that opt out of explicit enumeration.
+func TestWildcardAllowlist(t *testing.T) {
+	t.Run("ProjectScopeAuthorizer allows any non-empty project", func(t *testing.T) {
+		authorizer := NewProjectScopeAuthorizer([]string{"*"})
+		for _, p := range []string{"proj-a", "engram", "anything"} {
+			if err := authorizer.AuthorizeProject(p); err != nil {
+				t.Fatalf("expected wildcard to allow %q, got %v", p, err)
+			}
+		}
+		if err := authorizer.AuthorizeProject(""); err == nil {
+			t.Fatal("expected empty project to still be rejected even with wildcard")
+		}
+	})
+
+	t.Run("Service allows any non-empty project", func(t *testing.T) {
+		svc, err := NewService(&cloudstore.CloudStore{}, strings.Repeat("x", 32))
+		if err != nil {
+			t.Fatalf("new service: %v", err)
+		}
+		svc.SetAllowedProjects([]string{"*"})
+		if err := svc.AuthorizeProject("anything"); err != nil {
+			t.Fatalf("expected wildcard to allow any project, got %v", err)
+		}
+	})
+
+	t.Run("EnrolledProjects returns nil under wildcard to disable mutation filter", func(t *testing.T) {
+		authorizer := NewProjectScopeAuthorizer([]string{"*"})
+		if got := authorizer.EnrolledProjects(); got != nil {
+			t.Fatalf("expected nil (no filter) under wildcard, got %v", got)
+		}
+	})
+
+	t.Run("wildcard mixed with specific entries still allows all", func(t *testing.T) {
+		authorizer := NewProjectScopeAuthorizer([]string{"proj-a", "*"})
+		if err := authorizer.AuthorizeProject("unrelated"); err != nil {
+			t.Fatalf("expected wildcard to dominate, got %v", err)
+		}
+	})
+}
+
 // TestServiceEnrolledProjects mirrors the same contract on *Service, which
 // is the production type used by `engram cloud serve` auth wiring.
 func TestServiceEnrolledProjects(t *testing.T) {
