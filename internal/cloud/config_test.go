@@ -167,6 +167,102 @@ func TestConfigFromEnvDatabaseDSN(t *testing.T) {
 	})
 }
 
+func TestConfigFromEnvAuthMode(t *testing.T) {
+	t.Run("default auth mode is token", func(t *testing.T) {
+		t.Setenv("ENGRAM_AUTH_MODE", "")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.AuthMode != "token" {
+			t.Fatalf("expected default auth mode token, got %q", cfg.AuthMode)
+		}
+	})
+
+	t.Run("ldap value is accepted", func(t *testing.T) {
+		t.Setenv("ENGRAM_AUTH_MODE", "ldap")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.AuthMode != "ldap" {
+			t.Fatalf("expected ldap, got %q", cfg.AuthMode)
+		}
+	})
+
+	t.Run("invalid mode returns error listing accepted values", func(t *testing.T) {
+		t.Setenv("ENGRAM_AUTH_MODE", "both")
+		_, err := ConfigFromEnv()
+		if err == nil {
+			t.Fatal("expected error for invalid auth mode, got nil")
+		}
+		msg := err.Error()
+		if !strings.Contains(msg, "token") || !strings.Contains(msg, "ldap") {
+			t.Fatalf("expected error to list accepted values token/ldap, got %q", msg)
+		}
+	})
+
+	t.Run("whitespace and case are normalized", func(t *testing.T) {
+		t.Setenv("ENGRAM_AUTH_MODE", "  LDAP  ")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.AuthMode != "ldap" {
+			t.Fatalf("expected normalized ldap, got %q", cfg.AuthMode)
+		}
+	})
+}
+
+func TestConfigFromEnvAuthURL(t *testing.T) {
+	t.Run("auth url defaults empty", func(t *testing.T) {
+		t.Setenv("ENGRAM_AUTH_URL", "")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.AuthURL != "" {
+			t.Fatalf("expected empty default, got %q", cfg.AuthURL)
+		}
+	})
+
+	t.Run("env populates auth url", func(t *testing.T) {
+		t.Setenv("ENGRAM_AUTH_URL", "https://idp.example.com/api/v1/ldap/auth/login")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.AuthURL != "https://idp.example.com/api/v1/ldap/auth/login" {
+			t.Fatalf("unexpected auth url: %q", cfg.AuthURL)
+		}
+	})
+}
+
+func TestConfigFromEnvLDAPGroupMap(t *testing.T) {
+	t.Run("group map defaults empty", func(t *testing.T) {
+		t.Setenv("ENGRAM_LDAP_GROUP_MAP", "")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.LDAPGroupMap != "" {
+			t.Fatalf("expected empty default, got %q", cfg.LDAPGroupMap)
+		}
+	})
+
+	t.Run("env populates group map raw string", func(t *testing.T) {
+		raw := "ops:proj-a,proj-b;devs:proj-c"
+		t.Setenv("ENGRAM_LDAP_GROUP_MAP", raw)
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.LDAPGroupMap != raw {
+			t.Fatalf("expected raw passthrough, got %q", cfg.LDAPGroupMap)
+		}
+	})
+}
+
 func TestIsDefaultJWTSecret(t *testing.T) {
 	t.Run("default secret returns true", func(t *testing.T) {
 		if !IsDefaultJWTSecret(DefaultJWTSecret) {

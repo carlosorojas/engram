@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	cloudauth "github.com/Gentleman-Programming/engram/internal/cloud/auth"
 	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
 	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
 	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
@@ -32,6 +33,17 @@ type Authenticator interface {
 	Authorize(r *http.Request) error
 }
 
+// RequestAuthorizer is an OPTIONAL extension of Authenticator. Authenticators
+// that need to attach per-request state (e.g. a user-scoped project allowlist
+// derived from JWT claims) implement this in addition to Authenticator. The
+// middleware type-asserts and prefers AuthorizeRequest when available, using
+// the returned (mutated) request for downstream handlers so the attached
+// context propagates. Authenticators that only do identity checks (the
+// existing static-token Service) do NOT need to implement this.
+type RequestAuthorizer interface {
+	AuthorizeRequest(r *http.Request) (*http.Request, error)
+}
+
 type ProjectAuthorizer interface {
 	AuthorizeProject(project string) error
 }
@@ -49,6 +61,7 @@ type CloudServer struct {
 	store          ChunkStore
 	auth           Authenticator
 	projectAuth    ProjectAuthorizer
+	loginProxy     http.Handler
 	dashboardAdmin string
 	port           int
 	host           string
@@ -85,6 +98,15 @@ func WithProjectAuthorizer(authorizer ProjectAuthorizer) Option {
 func WithDashboardAdminToken(adminToken string) Option {
 	return func(s *CloudServer) {
 		s.dashboardAdmin = strings.TrimSpace(adminToken)
+	}
+}
+
+// WithLoginProxy wires an HTTP handler that serves POST /auth/ldap/login.
+// When set, the server mounts the route. When nil/unset, /auth/ldap/login
+// returns 404 (the default — token-mode behavior).
+func WithLoginProxy(h http.Handler) Option {
+	return func(s *CloudServer) {
+		s.loginProxy = h
 	}
 }
 
@@ -195,6 +217,9 @@ func (s *CloudServer) routes() {
 		MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
 		StatusProvider:    s.syncStatus,
 	})
+	if s.loginProxy != nil {
+		s.mux.Handle("POST /auth/ldap/login", s.loginProxy)
+	}
 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
 	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
 	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
@@ -204,26 +229,54 @@ func (s *CloudServer) routes() {
 
 func (s *CloudServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.auth != nil {
-			if err := s.auth.Authorize(r); err != nil {
-				http.Error(w, fmt.Sprintf("unauthorized: %v", err), http.StatusUnauthorized)
-				return
-			}
+		mutated, ok := s.runAuthMiddleware(w, r)
+		if !ok {
+			return
 		}
-		next(w, r)
+		next(w, mutated)
 	}
 }
 
 func (s *CloudServer) withAuthHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.auth != nil {
-			if err := s.auth.Authorize(r); err != nil {
-				http.Error(w, fmt.Sprintf("unauthorized: %v", err), http.StatusUnauthorized)
-				return
-			}
+		mutated, ok := s.runAuthMiddleware(w, r)
+		if !ok {
+			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, mutated)
 	})
+}
+
+// runAuthMiddleware authenticates the request, preferring RequestAuthorizer
+// (which can attach per-request state to context) over plain Authenticator.
+// Returns the (possibly mutated) request and true on success; on failure it
+// writes the error response and returns false. LDAP "no authorized groups"
+// is mapped to 403; everything else to 401.
+func (s *CloudServer) runAuthMiddleware(w http.ResponseWriter, r *http.Request) (*http.Request, bool) {
+	if s.auth == nil {
+		return r, true
+	}
+	if ra, ok := s.auth.(RequestAuthorizer); ok {
+		mutated, err := ra.AuthorizeRequest(r)
+		if err != nil {
+			s.writeAuthError(w, err)
+			return nil, false
+		}
+		return mutated, true
+	}
+	if err := s.auth.Authorize(r); err != nil {
+		http.Error(w, fmt.Sprintf("unauthorized: %v", err), http.StatusUnauthorized)
+		return nil, false
+	}
+	return r, true
+}
+
+func (s *CloudServer) writeAuthError(w http.ResponseWriter, err error) {
+	if errors.Is(err, cloudauth.ErrLDAPNoAuthorizedGroups) {
+		http.Error(w, fmt.Sprintf("forbidden: %v", err), http.StatusForbidden)
+		return
+	}
+	http.Error(w, fmt.Sprintf("unauthorized: %v", err), http.StatusUnauthorized)
 }
 
 func (s *CloudServer) authorizeDashboardRequest(r *http.Request) error {
@@ -308,7 +361,7 @@ func (s *CloudServer) handlePullManifest(w http.ResponseWriter, r *http.Request)
 	if !ok {
 		return
 	}
-	if !s.authorizeProjectScope(w, project) {
+	if !s.authorizeProjectScopeForRequest(w, r, project) {
 		return
 	}
 	manifest, err := s.store.ReadManifest(r.Context(), project)
@@ -324,7 +377,7 @@ func (s *CloudServer) handlePullChunk(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.authorizeProjectScope(w, project) {
+	if !s.authorizeProjectScopeForRequest(w, r, project) {
 		return
 	}
 	chunkID := strings.TrimSpace(r.PathValue("chunkID"))
@@ -381,7 +434,7 @@ func (s *CloudServer) handlePushChunk(w http.ResponseWriter, r *http.Request) {
 		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
 		return
 	}
-	if !s.authorizeProjectScope(w, project) {
+	if !s.authorizeProjectScopeForRequest(w, r, project) {
 		return
 	}
 
@@ -499,6 +552,23 @@ func projectFromRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
 }
 
 func (s *CloudServer) authorizeProjectScope(w http.ResponseWriter, project string) bool {
+	return s.authorizeProjectScopeForRequest(w, nil, project)
+}
+
+// authorizeProjectScopeForRequest enforces per-project authorization,
+// preferring a request-scoped authorizer attached to ctx (LDAP mode) over the
+// process-global one (token mode). Pass nil request to use only the global
+// authorizer — preserves existing call sites that pre-date LDAP mode.
+func (s *CloudServer) authorizeProjectScopeForRequest(w http.ResponseWriter, r *http.Request, project string) bool {
+	if r != nil {
+		if psa, ok := cloudauth.RequestAuthorizerFromContext(r.Context()); ok && psa != nil {
+			if err := psa.AuthorizeProject(project); err != nil {
+				writeActionableError(w, http.StatusForbidden, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, "forbidden: project is not allowed")
+				return false
+			}
+			return true
+		}
+	}
 	if s.projectAuth == nil {
 		return true
 	}

@@ -88,9 +88,31 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
 		_ = cs.Close()
 		return nil, err
 	}
+	cs.SetDashboardAllowedProjects(allowedProjects)
+
+	if cfg.AuthMode == cloud.AuthModeLDAP {
+		groupMap, err := auth.ParseGroupMap(cfg.LDAPGroupMap)
+		if err != nil {
+			_ = cs.Close()
+			return nil, fmt.Errorf("parse ENGRAM_LDAP_GROUP_MAP: %w", err)
+		}
+		ldapAuth := auth.NewLDAPAuthorizer(groupMap)
+		loginProxy := auth.NewLoginProxy(cfg.AuthURL, 10*time.Second)
+		return &defaultCloudRuntime{
+			server: cloudserver.New(
+				cs,
+				ldapAuth,
+				cfg.Port,
+				cloudserver.WithHost(cfg.BindHost),
+				cloudserver.WithLoginProxy(loginProxy),
+				cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
+			),
+			store: cs,
+		}, nil
+	}
+
 	projectAuth := auth.NewProjectScopeAuthorizer(allowedProjects)
 	token := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_TOKEN"))
-	cs.SetDashboardAllowedProjects(allowedProjects)
 	insecureNoAuth := token == "" && envBool("ENGRAM_CLOUD_INSECURE_NO_AUTH")
 	var authenticator cloudserver.Authenticator
 	if !insecureNoAuth {
@@ -150,12 +172,12 @@ type cloudConfig struct {
 func cmdCloud(cfg store.Config) {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: engram cloud <subcommand> [options]")
-		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade, repair")
+		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade, repair, login")
 		exitFunc(1)
 	}
 	if os.Args[2] == "--help" || os.Args[2] == "-h" || os.Args[2] == "help" {
 		fmt.Println("usage: engram cloud <subcommand> [options]")
-		fmt.Println("supported subcommands: status, enroll, config, serve, upgrade, repair")
+		fmt.Println("supported subcommands: status, enroll, config, serve, upgrade, repair, login")
 		return
 	}
 
@@ -172,9 +194,11 @@ func cmdCloud(cfg store.Config) {
 		cmdCloudUpgrade(cfg)
 	case "repair":
 		cmdCloudRepair()
+	case "login":
+		cmdCloudLogin(cfg)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown cloud command: %s\n", os.Args[2])
-		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade, repair")
+		fmt.Fprintln(os.Stderr, "supported subcommands: status, enroll, config, serve, upgrade, repair, login")
 		exitFunc(1)
 	}
 }
@@ -766,9 +790,31 @@ func validateCloudServeAuthConfig() error {
 	token := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_TOKEN"))
 	adminToken := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_ADMIN"))
 	insecureNoAuth := envBool("ENGRAM_CLOUD_INSECURE_NO_AUTH")
-	cfgForAuth, _ := cloud.ConfigFromEnv()
+	cfgForAuth, cfgErr := cloud.ConfigFromEnv()
+	if cfgErr != nil {
+		return cfgErr
+	}
 	allowlist := normalizeAllowedProjects(cfgForAuth.AllowedProjects)
 	jwtSecretEnv := strings.TrimSpace(os.Getenv("ENGRAM_JWT_SECRET"))
+
+	if cfgForAuth.AuthMode == cloud.AuthModeLDAP {
+		if token != "" {
+			return fmt.Errorf("conflicting cloud auth configuration: ENGRAM_CLOUD_TOKEN must be unset when ENGRAM_AUTH_MODE=ldap")
+		}
+		if insecureNoAuth {
+			return fmt.Errorf("ENGRAM_CLOUD_INSECURE_NO_AUTH is not supported when ENGRAM_AUTH_MODE=ldap")
+		}
+		if strings.TrimSpace(cfgForAuth.AuthURL) == "" {
+			return fmt.Errorf("ENGRAM_AUTH_URL is required when ENGRAM_AUTH_MODE=ldap")
+		}
+		if strings.TrimSpace(cfgForAuth.LDAPGroupMap) == "" {
+			return fmt.Errorf("ENGRAM_LDAP_GROUP_MAP is required when ENGRAM_AUTH_MODE=ldap")
+		}
+		if _, err := auth.ParseGroupMap(cfgForAuth.LDAPGroupMap); err != nil {
+			return fmt.Errorf("invalid ENGRAM_LDAP_GROUP_MAP: %w", err)
+		}
+		return nil
+	}
 	if insecureNoAuth && token != "" {
 		return fmt.Errorf("conflicting cloud auth configuration: ENGRAM_CLOUD_INSECURE_NO_AUTH=1 cannot be used together with ENGRAM_CLOUD_TOKEN")
 	}
