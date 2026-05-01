@@ -20,6 +20,7 @@ type Config struct {
 	AllowedProjects []string
 	AuthMode        string
 	AuthURL         string
+	AuthAPIKey      string
 	LDAPGroupMap    string
 }
 
@@ -79,6 +80,9 @@ func ConfigFromEnv() (Config, error) {
 	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_AUTH_URL")); v != "" {
 		cfg.AuthURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ENGRAM_AUTH_API_KEY")); v != "" {
+		cfg.AuthAPIKey = v
 	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_LDAP_GROUP_MAP")); v != "" {
 		cfg.LDAPGroupMap = v

@@ -12,6 +12,7 @@ func clearAuthEnv(t *testing.T) {
 	for _, k := range []string{
 		"ENGRAM_AUTH_MODE",
 		"ENGRAM_AUTH_URL",
+		"ENGRAM_AUTH_API_KEY",
 		"ENGRAM_LDAP_GROUP_MAP",
 		"ENGRAM_CLOUD_TOKEN",
 		"ENGRAM_CLOUD_ADMIN",
@@ -27,6 +28,7 @@ func TestValidateCloudServeAuthConfigLDAPRequiresAuthURL(t *testing.T) {
 	clearAuthEnv(t)
 	t.Setenv("ENGRAM_AUTH_MODE", "ldap")
 	t.Setenv("ENGRAM_LDAP_GROUP_MAP", "ops:proj-a")
+	t.Setenv("ENGRAM_AUTH_API_KEY", "k")
 
 	err := validateCloudServeAuthConfig()
 	if err == nil {
@@ -37,10 +39,26 @@ func TestValidateCloudServeAuthConfigLDAPRequiresAuthURL(t *testing.T) {
 	}
 }
 
+func TestValidateCloudServeAuthConfigLDAPRequiresAPIKey(t *testing.T) {
+	clearAuthEnv(t)
+	t.Setenv("ENGRAM_AUTH_MODE", "ldap")
+	t.Setenv("ENGRAM_AUTH_URL", "https://idp.example.com/api/v1/ldap/auth/login")
+	t.Setenv("ENGRAM_LDAP_GROUP_MAP", "ops:proj-a")
+
+	err := validateCloudServeAuthConfig()
+	if err == nil {
+		t.Fatal("expected error: missing ENGRAM_AUTH_API_KEY in ldap mode")
+	}
+	if !strings.Contains(err.Error(), "ENGRAM_AUTH_API_KEY") {
+		t.Fatalf("expected error to name ENGRAM_AUTH_API_KEY, got %q", err.Error())
+	}
+}
+
 func TestValidateCloudServeAuthConfigLDAPRequiresGroupMap(t *testing.T) {
 	clearAuthEnv(t)
 	t.Setenv("ENGRAM_AUTH_MODE", "ldap")
 	t.Setenv("ENGRAM_AUTH_URL", "https://idp.example.com/api/v1/ldap/auth/login")
+	t.Setenv("ENGRAM_AUTH_API_KEY", "k")
 
 	err := validateCloudServeAuthConfig()
 	if err == nil {
@@ -55,6 +73,7 @@ func TestValidateCloudServeAuthConfigLDAPRejectsCloudToken(t *testing.T) {
 	clearAuthEnv(t)
 	t.Setenv("ENGRAM_AUTH_MODE", "ldap")
 	t.Setenv("ENGRAM_AUTH_URL", "https://idp.example.com/api/v1/ldap/auth/login")
+	t.Setenv("ENGRAM_AUTH_API_KEY", "k")
 	t.Setenv("ENGRAM_LDAP_GROUP_MAP", "ops:proj-a")
 	t.Setenv("ENGRAM_CLOUD_TOKEN", "static-token-should-not-be-set")
 
@@ -71,6 +90,7 @@ func TestValidateCloudServeAuthConfigLDAPRejectsGroupMapParseError(t *testing.T)
 	clearAuthEnv(t)
 	t.Setenv("ENGRAM_AUTH_MODE", "ldap")
 	t.Setenv("ENGRAM_AUTH_URL", "https://idp.example.com/api/v1/ldap/auth/login")
+	t.Setenv("ENGRAM_AUTH_API_KEY", "k")
 	t.Setenv("ENGRAM_LDAP_GROUP_MAP", "ops:proj-a;ops:proj-b") // duplicate
 
 	err := validateCloudServeAuthConfig()
@@ -86,6 +106,7 @@ func TestValidateCloudServeAuthConfigLDAPSuccess(t *testing.T) {
 	clearAuthEnv(t)
 	t.Setenv("ENGRAM_AUTH_MODE", "ldap")
 	t.Setenv("ENGRAM_AUTH_URL", "https://idp.example.com/api/v1/ldap/auth/login")
+	t.Setenv("ENGRAM_AUTH_API_KEY", "k")
 	t.Setenv("ENGRAM_LDAP_GROUP_MAP", "ops:proj-a,proj-b;devs:proj-c")
 
 	if err := validateCloudServeAuthConfig(); err != nil {
