@@ -2295,7 +2295,15 @@ Environment:
   ENGRAM_PORT        Override HTTP server port (default: 7437)
   ENGRAM_PROJECT     Override auto-detected project name for MCP server
   ENGRAM_DATABASE_URL
-                     Postgres DSN for engram cloud serve
+                     Postgres DSN for engram cloud serve. Takes precedence over the
+                     component variables below.
+  ENGRAM_DATABASE_USER, ENGRAM_DATABASE_PASSWORD, ENGRAM_DATABASE_HOST,
+  ENGRAM_DATABASE_PORT, ENGRAM_DATABASE
+                     Component variables used to build the Postgres DSN when
+                     ENGRAM_DATABASE_URL is not set. If any is set, all five are
+                     required.
+  ENGRAM_DATABASE_SSLMODE
+                     Postgres sslmode for the component-built DSN (default: disable)
   ENGRAM_CLOUD_HOST  Bind host for engram cloud serve (default: 127.0.0.1)
   ENGRAM_CLOUD_TOKEN Bearer token required in authenticated cloud serve mode
   ENGRAM_CLOUD_INSECURE_NO_AUTH
@@ -2305,6 +2313,8 @@ Environment:
   ENGRAM_CLOUD_ALLOWED_PROJECTS
 	                     Comma-separated project allowlist enforced by cloud server
 	                     Required for cloud serve in BOTH token auth and insecure no-auth mode
+	                     Use '*' (single entry) to allow ALL projects — intended for
+	                     single-tenant or local dev deployments
 	ENGRAM_JWT_SECRET   Required in authenticated cloud serve mode (ENGRAM_CLOUD_TOKEN set);
 	                     must be explicitly set to a non-default value
 	ENGRAM_CLOUD_ADMIN  Optional admin-only dashboard token in authenticated mode

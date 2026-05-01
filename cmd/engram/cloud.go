@@ -672,7 +672,11 @@ func validateCloudServerURL(raw string) (string, error) {
 }
 
 func cmdCloudServe() {
-	runtimeCfg := cloud.ConfigFromEnv()
+	runtimeCfg, err := cloud.ConfigFromEnv()
+	if err != nil {
+		fatal(err)
+		return
+	}
 	if err := validateCloudServeAuthConfig(); err != nil {
 		fatal(err)
 		return
@@ -692,7 +696,8 @@ func validateCloudServeAuthConfig() error {
 	token := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_TOKEN"))
 	adminToken := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_ADMIN"))
 	insecureNoAuth := envBool("ENGRAM_CLOUD_INSECURE_NO_AUTH")
-	allowlist := normalizeAllowedProjects(cloud.ConfigFromEnv().AllowedProjects)
+	cfgForAuth, _ := cloud.ConfigFromEnv()
+	allowlist := normalizeAllowedProjects(cfgForAuth.AllowedProjects)
 	jwtSecretEnv := strings.TrimSpace(os.Getenv("ENGRAM_JWT_SECRET"))
 	if insecureNoAuth && token != "" {
 		return fmt.Errorf("conflicting cloud auth configuration: ENGRAM_CLOUD_INSECURE_NO_AUTH=1 cannot be used together with ENGRAM_CLOUD_TOKEN")
