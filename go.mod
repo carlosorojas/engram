@@ -7,9 +7,11 @@ require (
 	github.com/charmbracelet/bubbles v1.0.0
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jackc/pgx/v5 v5.7.6
 	github.com/mark3labs/mcp-go v0.44.0
 	golang.org/x/net v0.52.0
+	golang.org/x/term v0.42.0
 	modernc.org/sqlite v1.45.0
 )
 

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -20,6 +21,27 @@ var ErrSecretTooShort = errors.New("jwt secret must be at least 32 bytes")
 var ErrBearerTokenNotConfigured = errors.New("cloud bearer token is not configured")
 var ErrInvalidDashboardSessionToken = errors.New("invalid dashboard session token")
 var ErrProjectNotAllowed = errors.New("project is not allowed for this token")
+
+// ctxKey is a private type used to namespace context keys owned by this package.
+// Keeping the type unexported prevents external packages from minting collisions.
+type ctxKey int
+
+const requestAuthorizerKey ctxKey = iota
+
+// WithRequestAuthorizer returns a copy of ctx that carries the given
+// per-request ProjectScopeAuthorizer. The cloud server reads this in the
+// project-check site so LDAP-mode requests use a user-scoped allowlist
+// instead of the process-global one.
+func WithRequestAuthorizer(ctx context.Context, authz *ProjectScopeAuthorizer) context.Context {
+	return context.WithValue(ctx, requestAuthorizerKey, authz)
+}
+
+// RequestAuthorizerFromContext returns the per-request authorizer attached by
+// WithRequestAuthorizer, or (nil, false) when none is present (token mode).
+func RequestAuthorizerFromContext(ctx context.Context) (*ProjectScopeAuthorizer, bool) {
+	authz, ok := ctx.Value(requestAuthorizerKey).(*ProjectScopeAuthorizer)
+	return authz, ok
+}
 
 type Service struct {
 	store         *cloudstore.CloudStore

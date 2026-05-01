@@ -18,9 +18,17 @@ type Config struct {
 	BindHost        string
 	AdminToken      string
 	AllowedProjects []string
+	AuthMode        string
+	AuthURL         string
+	LDAPGroupMap    string
 }
 
 const DefaultJWTSecret = "engram-dev-jwt-secret-for-local-smoke-1234"
+
+const (
+	AuthModeToken = "token"
+	AuthModeLDAP  = "ldap"
+)
 
 func DefaultConfig() Config {
 	return Config{
@@ -30,6 +38,7 @@ func DefaultConfig() Config {
 		MaxPool:     10,
 		Port:        8080,
 		BindHost:    "127.0.0.1",
+		AuthMode:    AuthModeToken,
 	}
 }
 
@@ -59,6 +68,20 @@ func ConfigFromEnv() (Config, error) {
 	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_HOST")); v != "" {
 		cfg.BindHost = v
+	}
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ENGRAM_AUTH_MODE"))); v != "" {
+		switch v {
+		case AuthModeToken, AuthModeLDAP:
+			cfg.AuthMode = v
+		default:
+			return cfg, fmt.Errorf("invalid ENGRAM_AUTH_MODE %q: accepted values are %q and %q", v, AuthModeToken, AuthModeLDAP)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("ENGRAM_AUTH_URL")); v != "" {
+		cfg.AuthURL = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ENGRAM_LDAP_GROUP_MAP")); v != "" {
+		cfg.LDAPGroupMap = v
 	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_ALLOWED_PROJECTS")); v != "" {
 		parts := strings.Split(v, ",")
