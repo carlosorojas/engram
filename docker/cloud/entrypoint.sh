@@ -16,6 +16,8 @@ set -eu
 # LDAP mode (ENGRAM_AUTH_MODE=ldap):
 #   ENGRAM_AUTH_URL          required — full upstream login URL
 #                            (e.g. https://idp.example.com/api/v1/ldap/auth/login)
+#   ENGRAM_AUTH_API_KEY      required — sent as `x-api-key` header on every
+#                            upstream call (server-to-upstream shared secret)
 #   ENGRAM_LDAP_GROUP_MAP    required — group→projects map
 #                            format: "group1:projA,projB;group2:projC"
 #                            "*" wildcard project grants all projects

@@ -91,3 +91,49 @@ func TestLoginProxyConnectionRefusedReturns502(t *testing.T) {
 		t.Fatalf("expected 502 on connection refused, got %d (body=%s)", rec.Code, rec.Body.String())
 	}
 }
+
+func TestLoginProxyAddsAPIKeyHeader(t *testing.T) {
+	receivedKey := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedKey = r.Header.Get("x-api-key")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"OK","token":"t"}`))
+	}))
+	defer upstream.Close()
+
+	proxy := NewLoginProxy(upstream.URL, 5*time.Second)
+	proxy.APIKey = "secret-shared-with-upstream"
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/ldap/login", strings.NewReader(`{"username":"a","password":"b"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if receivedKey != "secret-shared-with-upstream" {
+		t.Fatalf("expected upstream to receive x-api-key, got %q", receivedKey)
+	}
+}
+
+func TestLoginProxyOmitsAPIKeyHeaderWhenEmpty(t *testing.T) {
+	receivedKey := "PRESENT"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedKey = r.Header.Get("x-api-key")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	proxy := NewLoginProxy(upstream.URL, 5*time.Second)
+	// APIKey deliberately left empty.
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/ldap/login", strings.NewReader(`{}`))
+	rec := httptest.NewRecorder()
+	proxy.ServeHTTP(rec, req)
+
+	if receivedKey != "" {
+		t.Fatalf("expected no x-api-key header sent upstream, got %q", receivedKey)
+	}
+}

@@ -98,6 +98,7 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
 		}
 		ldapAuth := auth.NewLDAPAuthorizer(groupMap)
 		loginProxy := auth.NewLoginProxy(cfg.AuthURL, 10*time.Second)
+		loginProxy.APIKey = cfg.AuthAPIKey
 		return &defaultCloudRuntime{
 			server: cloudserver.New(
 				cs,
@@ -232,7 +233,12 @@ func cmdCloudRepair() {
 		return
 	}
 
-	cs, err := cloudstore.New(cloud.ConfigFromEnv())
+	cfg, err := cloud.ConfigFromEnv()
+	if err != nil {
+		fatal(err)
+		return
+	}
+	cs, err := cloudstore.New(cfg)
 	if err != nil {
 		fatal(err)
 		return
@@ -806,6 +812,9 @@ func validateCloudServeAuthConfig() error {
 		}
 		if strings.TrimSpace(cfgForAuth.AuthURL) == "" {
 			return fmt.Errorf("ENGRAM_AUTH_URL is required when ENGRAM_AUTH_MODE=ldap")
+		}
+		if strings.TrimSpace(cfgForAuth.AuthAPIKey) == "" {
+			return fmt.Errorf("ENGRAM_AUTH_API_KEY is required when ENGRAM_AUTH_MODE=ldap (sent as x-api-key header to the upstream auth service)")
 		}
 		if strings.TrimSpace(cfgForAuth.LDAPGroupMap) == "" {
 			return fmt.Errorf("ENGRAM_LDAP_GROUP_MAP is required when ENGRAM_AUTH_MODE=ldap")

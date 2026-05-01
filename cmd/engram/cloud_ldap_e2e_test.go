@@ -136,6 +136,7 @@ func TestCloudServeLDAPModeUsesEnvConfig(t *testing.T) {
 	clearAuthEnv(t)
 	t.Setenv("ENGRAM_AUTH_MODE", "ldap")
 	t.Setenv("ENGRAM_AUTH_URL", "https://idp.example.com/api/v1/ldap/auth/login")
+	t.Setenv("ENGRAM_AUTH_API_KEY", "k")
 	t.Setenv("ENGRAM_LDAP_GROUP_MAP", "ops:proj-a")
 
 	cfg, err := cloud.ConfigFromEnv()

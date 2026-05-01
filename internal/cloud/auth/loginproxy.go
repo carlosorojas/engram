@@ -10,15 +10,19 @@ import (
 
 // LoginProxy forwards client login requests to an upstream LDAP auth service
 // and returns the upstream response verbatim. The cloud server does not
-// inspect, modify, or persist credentials — it only relays.
+// inspect, modify, or persist credentials — it only relays. When APIKey is
+// non-empty, it is attached as the `x-api-key` header on every upstream
+// request: this is a server-to-upstream shared secret, intentionally NOT
+// exposed to clients.
 type LoginProxy struct {
 	UpstreamURL string
 	Client      *http.Client
+	APIKey      string
 }
 
 // NewLoginProxy returns a LoginProxy with an http.Client whose Timeout is the
-// provided duration. The timeout covers the entire upstream round-trip
-// (connect + write request + read response).
+// provided duration. Set APIKey on the returned value if the upstream service
+// requires an x-api-key header.
 func NewLoginProxy(upstreamURL string, timeout time.Duration) *LoginProxy {
 	return &LoginProxy{
 		UpstreamURL: upstreamURL,
@@ -36,6 +40,9 @@ func (p *LoginProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		upstreamReq.Header.Set("Content-Type", ct)
 	} else {
 		upstreamReq.Header.Set("Content-Type", "application/json")
+	}
+	if p.APIKey != "" {
+		upstreamReq.Header.Set("x-api-key", p.APIKey)
 	}
 
 	resp, err := p.Client.Do(upstreamReq)
