@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -53,6 +54,19 @@ type dashboardSessionCodec interface {
 	ParseDashboardSession(sessionToken string) (string, error)
 }
 
+// ldapDashboardSessionCodec is a separate interface for the LDAP-specific
+// dashboard session codec. It operates on (jwt, UserInfo) pairs rather than
+// plain bearer tokens, carrying display information alongside the credential.
+type ldapDashboardSessionCodec interface {
+	MintDashboardSession(rawJWT string, info cloudauth.UserInfo) (string, error)
+	ParseDashboardSession(token string) (rawJWT string, info cloudauth.UserInfo, err error)
+}
+
+// errLDAPRateLimited is a sentinel returned internally when the rate limiter
+// blocks a login attempt. It is never surfaced directly to the browser —
+// the rate-limit middleware writes the 429 response directly.
+var errLDAPRateLimited = errors.New("ldap: rate limited")
+
 type staticStatusProvider struct{ status dashboard.SyncStatus }
 
 func (s staticStatusProvider) Status() dashboard.SyncStatus { return s.status }
@@ -68,6 +82,11 @@ type CloudServer struct {
 	mux            *http.ServeMux
 	syncStatus     dashboard.SyncStatusProvider
 	listenAndServe func(addr string, handler http.Handler) error
+
+	// LDAP dashboard session fields.
+	ldapCodec     ldapDashboardSessionCodec
+	ldapLimiter   cloudauth.Limiter
+	ldapLoginFunc func(ctx context.Context, user, pass string) (jwt string, info cloudauth.UserInfo, err error)
 }
 
 const defaultHost = "127.0.0.1"
@@ -108,6 +127,50 @@ func WithLoginProxy(h http.Handler) Option {
 	return func(s *CloudServer) {
 		s.loginProxy = h
 	}
+}
+
+// WithLDAPSessionCodec wires the LDAP dashboard session codec. When set
+// alongside WithLDAPLoginFunc, the dashboard login page renders in LDAP mode
+// (username+password form) and mints HMAC-signed session cookies.
+func WithLDAPSessionCodec(codec ldapDashboardSessionCodec) Option {
+	return func(s *CloudServer) {
+		s.ldapCodec = codec
+	}
+}
+
+// WithLDAPLoginFunc wires the LDAP login function used by the dashboard login
+// handler. The function receives a context and credentials, calls the upstream
+// auth service, and returns the raw JWT + UserInfo on success.
+func WithLDAPLoginFunc(fn func(ctx context.Context, user, pass string) (jwt string, info cloudauth.UserInfo, err error)) Option {
+	return func(s *CloudServer) {
+		s.ldapLoginFunc = fn
+	}
+}
+
+// WithLDAPLimiter wires a rate limiter for LDAP dashboard login submissions.
+// When set, each POST /dashboard/login attempt is checked via limiter.Allow
+// keyed by the client IP (r.RemoteAddr host portion) BEFORE the login
+// function is invoked. Denied requests receive 429 with a Retry-After header.
+//
+// X-Forwarded-For is intentionally NOT consulted: this server is designed for
+// single-instance deployments behind no proxy, so RemoteAddr is the true
+// client IP.
+func WithLDAPLimiter(l cloudauth.Limiter) Option {
+	return func(s *CloudServer) {
+		s.ldapLimiter = l
+	}
+}
+
+// clientIP returns the host portion of r.RemoteAddr, suitable for use as a
+// rate-limit key. Falls back to the full RemoteAddr string on parse error.
+//
+// X-Forwarded-For is intentionally NOT consulted; see WithLDAPLimiter.
+func clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 func New(store ChunkStore, authSvc Authenticator, port int, opts ...Option) *CloudServer {
@@ -192,7 +255,89 @@ func (s *CloudServer) routes() {
 		validateLoginToken = nil
 		createSessionCookie = nil
 	}
-	dashboard.Mount(s.mux, dashboard.MountConfig{
+
+	// LDAP mode closures — wired when both ldapCodec and ldapLoginFunc are set.
+	var ldapLoginFn func(ctx context.Context, username, password string) (string, dashboard.LDAPUserInfo, error)
+	var createLDAPSessionCookieFn func(w http.ResponseWriter, r *http.Request, rawJWT string, info dashboard.LDAPUserInfo) error
+
+	if s.ldapCodec != nil && s.ldapLoginFunc != nil {
+		ldapLoginFn = func(ctx context.Context, username, password string) (string, dashboard.LDAPUserInfo, error) {
+			rawJWT, authInfo, err := s.ldapLoginFunc(ctx, username, password)
+			if err != nil {
+				return "", dashboard.LDAPUserInfo{}, err
+			}
+			ui := dashboard.LDAPUserInfo{
+				UID:       authInfo.UID,
+				CN:        authInfo.CN,
+				Mail:      authInfo.Mail,
+				GivenName: authInfo.GivenName,
+				SN:        authInfo.SN,
+			}
+			return rawJWT, ui, nil
+		}
+
+		createLDAPSessionCookieFn = func(w http.ResponseWriter, r *http.Request, rawJWT string, info dashboard.LDAPUserInfo) error {
+			authInfo := cloudauth.UserInfo{
+				UID:       info.UID,
+				CN:        info.CN,
+				Mail:      info.Mail,
+				GivenName: info.GivenName,
+				SN:        info.SN,
+			}
+			token, err := s.ldapCodec.MintDashboardSession(rawJWT, authInfo)
+			if err != nil {
+				if errors.Is(err, cloudauth.ErrJWTMissingExp) || errors.Is(err, cloudauth.ErrJWTExpired) {
+					return fmt.Errorf("%w: %w", dashboard.ErrLDAPJWTInvalid, err)
+				}
+				return err
+			}
+			maxAge, err := cloudauth.ExtractMaxAge(rawJWT, time.Now)
+			if err != nil {
+				// MintDashboardSession already validated exp; this is a safety net.
+				maxAge = 0
+			}
+			if maxAge < 0 {
+				maxAge = 0
+			}
+			http.SetCookie(w, &http.Cookie{
+				Name:     dashboardSessionCookieName,
+				Value:    token,
+				Path:     "/dashboard",
+				HttpOnly: true,
+				Secure:   dashboardCookieSecure(r),
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   maxAge,
+			})
+			return nil
+		}
+	}
+
+	// GetDisplayName closure — reads the LDAP session cookie when available.
+	getDisplayName := func(r *http.Request) string {
+		if s.ldapCodec == nil {
+			return "OPERATOR"
+		}
+		cookie, err := r.Cookie(dashboardSessionCookieName)
+		if err != nil {
+			return "OPERATOR"
+		}
+		_, authInfo, err := s.ldapCodec.ParseDashboardSession(cookie.Value)
+		if err != nil {
+			return "OPERATOR"
+		}
+		return dashboard.DisplayNameFromUserInfo(dashboard.LDAPUserInfo{
+			UID:       authInfo.UID,
+			CN:        authInfo.CN,
+			Mail:      authInfo.Mail,
+			GivenName: authInfo.GivenName,
+			SN:        authInfo.SN,
+		})
+	}
+
+	// Mount the dashboard on an inner mux so we can wrap POST /dashboard/login
+	// with the LDAP rate-limit middleware at the outer mux level.
+	dashMux := http.NewServeMux()
+	dashboard.Mount(dashMux, dashboard.MountConfig{
 		RequireSession:      s.authorizeDashboardRequest,
 		ValidateLoginToken:  validateLoginToken,
 		CreateSessionCookie: createSessionCookie,
@@ -210,15 +355,39 @@ func (s *CloudServer) routes() {
 		IsAdmin: func(r *http.Request) bool {
 			return s.isDashboardAdmin(r)
 		},
-		// GetDisplayName: returns "OPERATOR" until the session codec surfaces a
-		// display name (out of scope for this change). Satisfies REQ-103 / AD-2.
-		GetDisplayName:    func(r *http.Request) string { return "OPERATOR" },
-		Store:             dashboardStore,
-		MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
-		StatusProvider:    s.syncStatus,
+		GetDisplayName:          getDisplayName,
+		Store:                   dashboardStore,
+		MaxLoginBodyBytes:       maxDashboardLoginBodyBytes,
+		StatusProvider:          s.syncStatus,
+		LDAPLogin:               ldapLoginFn,
+		CreateLDAPSessionCookie: createLDAPSessionCookieFn,
 	})
+
+	// Register dashboard routes on the outer mux. When LDAP limiter is active,
+	// POST /dashboard/login is wrapped with a 429 gate; all other dashboard
+	// routes are forwarded directly.
+	if s.ldapLimiter != nil && s.ldapCodec != nil && s.ldapLoginFunc != nil {
+		// Wrap POST /dashboard/login with the rate-limit middleware.
+		s.mux.HandleFunc("POST /dashboard/login", func(w http.ResponseWriter, r *http.Request) {
+			ip := clientIP(r)
+			if !s.ldapLimiter.Allow(ip) {
+				w.Header().Set("Retry-After", "60")
+				http.Error(w, "too many login attempts; try again later", http.StatusTooManyRequests)
+				return
+			}
+			dashMux.ServeHTTP(w, r)
+		})
+	}
+	// Forward all other dashboard traffic (and POST /dashboard/login in
+	// non-rate-limited mode) to the inner mux.
+	s.mux.Handle("/dashboard/", dashMux)
+	s.mux.Handle("/dashboard", dashMux)
+
 	if s.loginProxy != nil {
+		log.Printf("[engram-cloud] mounting POST /auth/ldap/login (LDAP mode)")
 		s.mux.Handle("POST /auth/ldap/login", s.loginProxy)
+	} else {
+		log.Printf("[engram-cloud] LDAP login proxy NOT mounted (token mode or proxy unset)")
 	}
 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
 	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
@@ -313,6 +482,11 @@ func (s *CloudServer) dashboardBearerToken(sessionToken string) (string, error) 
 	sessionToken = strings.TrimSpace(sessionToken)
 	if sessionToken == "" {
 		return "", fmt.Errorf("dashboard session token is empty")
+	}
+	// LDAP mode: parse via the LDAP codec which returns (jwt, info, err).
+	if s.ldapCodec != nil {
+		jwt, _, err := s.ldapCodec.ParseDashboardSession(sessionToken)
+		return jwt, err
 	}
 	if codec, ok := s.auth.(dashboardSessionCodec); ok {
 		return codec.ParseDashboardSession(sessionToken)

@@ -8,14 +8,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	cloudauth "github.com/Gentleman-Programming/engram/internal/cloud/auth"
 	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
 	"github.com/Gentleman-Programming/engram/internal/cloud/dashboard"
 	"github.com/Gentleman-Programming/engram/internal/store"
 	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 type fakeStore struct {
@@ -1520,4 +1523,201 @@ func TestInsecureModeLoginRedirects(t *testing.T) {
 	if loc := rec.Header().Get("Location"); loc != "/dashboard/" {
 		t.Fatalf("expected redirect to /dashboard/, got %q", loc)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 tests — LDAP session codec wiring at cloudserver level
+// ---------------------------------------------------------------------------
+
+// stubLDAPCodec implements ldapDashboardSessionCodec for testing.
+type stubLDAPCodec struct {
+	mintErr error // if non-nil, MintDashboardSession returns this
+	token   string
+}
+
+func (s *stubLDAPCodec) MintDashboardSession(rawJWT string, info cloudauth.UserInfo) (string, error) {
+	if s.mintErr != nil {
+		return "", s.mintErr
+	}
+	if s.token != "" {
+		return s.token, nil
+	}
+	return "stub-session-token", nil
+}
+
+func (s *stubLDAPCodec) ParseDashboardSession(token string) (string, cloudauth.UserInfo, error) {
+	return "stub-jwt", cloudauth.UserInfo{CN: "Stub User"}, nil
+}
+
+// stubLDAPLoginFunc returns a canned successful login response containing a JWT
+// with the given exp claim.
+func stubLDAPLoginWithExp(expUnix int64) func(ctx context.Context, user, pass string) (string, cloudauth.UserInfo, error) {
+	return func(_ context.Context, _, _ string) (string, cloudauth.UserInfo, error) {
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"sub": "alice",
+			"exp": float64(expUnix),
+		})
+		signed, err := tok.SignedString([]byte("test-key-decoded-only-by-engram"))
+		if err != nil {
+			panic("stubLDAPLoginWithExp: mint jwt: " + err.Error())
+		}
+		return signed, cloudauth.UserInfo{CN: "Alice"}, nil
+	}
+}
+
+func postLDAPLogin(t *testing.T, srv *CloudServer, username, password string) *httptest.ResponseRecorder {
+	t.Helper()
+	form := url.Values{}
+	form.Set("username", username)
+	form.Set("password", password)
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	return rec
+}
+
+// 6.1 RED: cookie MaxAge derived from JWT exp (≈3600s). (REQ-8)
+func TestWithLDAPSessionCodec_CookieMaxAgeFromExp(t *testing.T) {
+	expUnix := time.Now().Add(3600 * time.Second).Unix()
+	loginFn := stubLDAPLoginWithExp(expUnix)
+	codec := &stubLDAPCodec{} // Mint delegates to real codec below via WithLDAPSessionCodec
+
+	// Use real LDAPSessionCodec so MaxAge is computed from the JWT exp.
+	realCodec, err := cloudauth.NewLDAPSessionCodec("test-ldap-secret-for-cs")
+	if err != nil {
+		t.Fatalf("NewLDAPSessionCodec: %v", err)
+	}
+	_ = codec // we use realCodec directly
+
+	srv := New(&fakeStore{}, fakeAuth{}, 0,
+		WithLDAPSessionCodec(realCodec),
+		WithLDAPLoginFunc(loginFn),
+	)
+	rec := postLDAPLogin(t, srv, "alice", "s3cret")
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	cookies := rec.Result().Cookies()
+	var sessionCookie *http.Cookie
+	for _, c := range cookies {
+		if c.Name == dashboardSessionCookieName {
+			sessionCookie = c
+			break
+		}
+	}
+	if sessionCookie == nil {
+		t.Fatalf("expected Set-Cookie %q, got none (cookies=%v)", dashboardSessionCookieName, cookies)
+	}
+	const wantMaxAge = 3600
+	const tolerance = 5
+	if sessionCookie.MaxAge < wantMaxAge-tolerance || sessionCookie.MaxAge > wantMaxAge+tolerance {
+		t.Fatalf("expected MaxAge ≈ %d (±%d), got %d", wantMaxAge, tolerance, sessionCookie.MaxAge)
+	}
+}
+
+// 6.2 RED: MintDashboardSession returns ErrJWTMissingExp → no Set-Cookie, error form. (REQ-6)
+func TestWithLDAPSessionCodec_RejectsMissingExp(t *testing.T) {
+	loginFn := func(_ context.Context, _, _ string) (string, cloudauth.UserInfo, error) {
+		// JWT with no exp claim.
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": "alice"})
+		signed, _ := tok.SignedString([]byte("test-key-decoded-only-by-engram"))
+		return signed, cloudauth.UserInfo{}, nil
+	}
+	realCodec, err := cloudauth.NewLDAPSessionCodec("test-ldap-secret-for-cs")
+	if err != nil {
+		t.Fatalf("NewLDAPSessionCodec: %v", err)
+	}
+
+	srv := New(&fakeStore{}, fakeAuth{}, 0,
+		WithLDAPSessionCodec(realCodec),
+		WithLDAPLoginFunc(loginFn),
+	)
+	rec := postLDAPLogin(t, srv, "alice", "s3cret")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (error form), got %d body=%q", rec.Code, rec.Body.String())
+	}
+	// No Set-Cookie header.
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == dashboardSessionCookieName {
+			t.Fatalf("expected no session cookie on ErrJWTMissingExp, but got one: %v", c)
+		}
+	}
+	// Response should include an error message rendered by LDAPLoginPage.
+	body := rec.Body.String()
+	if !strings.Contains(body, "username") || !strings.Contains(body, "password") {
+		t.Fatalf("expected LDAPLoginPage form in response body, got %q", body[:minInt(200, len(body))])
+	}
+}
+
+// 6.3 RED: MintDashboardSession returns ErrJWTExpired → error form, no cookie. (REQ-7)
+func TestWithLDAPSessionCodec_RejectsExpiredJWT(t *testing.T) {
+	loginFn := func(_ context.Context, _, _ string) (string, cloudauth.UserInfo, error) {
+		// JWT expired 31s ago — beyond 30s leeway.
+		expUnix := time.Now().Add(-31 * time.Second).Unix()
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"sub": "alice",
+			"exp": float64(expUnix),
+		})
+		signed, _ := tok.SignedString([]byte("test-key-decoded-only-by-engram"))
+		return signed, cloudauth.UserInfo{}, nil
+	}
+	realCodec, err := cloudauth.NewLDAPSessionCodec("test-ldap-secret-for-cs")
+	if err != nil {
+		t.Fatalf("NewLDAPSessionCodec: %v", err)
+	}
+
+	srv := New(&fakeStore{}, fakeAuth{}, 0,
+		WithLDAPSessionCodec(realCodec),
+		WithLDAPLoginFunc(loginFn),
+	)
+	rec := postLDAPLogin(t, srv, "alice", "s3cret")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 (error form), got %d body=%q", rec.Code, rec.Body.String())
+	}
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == dashboardSessionCookieName {
+			t.Fatalf("expected no session cookie on ErrJWTExpired, but got one: %v", c)
+		}
+	}
+}
+
+// 6.4 RED: exp=now-29s (within 30s leeway) → cookie set successfully. (REQ-7 leeway)
+func TestWithLDAPSessionCodec_LeewayBoundary(t *testing.T) {
+	expUnix := time.Now().Add(-29 * time.Second).Unix()
+	loginFn := stubLDAPLoginWithExp(expUnix)
+	realCodec, err := cloudauth.NewLDAPSessionCodec("test-ldap-secret-for-cs")
+	if err != nil {
+		t.Fatalf("NewLDAPSessionCodec: %v", err)
+	}
+
+	srv := New(&fakeStore{}, fakeAuth{}, 0,
+		WithLDAPSessionCodec(realCodec),
+		WithLDAPLoginFunc(loginFn),
+	)
+	rec := postLDAPLogin(t, srv, "alice", "s3cret")
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 (leeway success), got %d body=%q", rec.Code, rec.Body.String())
+	}
+	var got *http.Cookie
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == dashboardSessionCookieName {
+			got = c
+			break
+		}
+	}
+	if got == nil {
+		t.Fatalf("expected session cookie within leeway window, got none")
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
