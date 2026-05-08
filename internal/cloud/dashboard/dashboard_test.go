@@ -3104,3 +3104,352 @@ func TestAdminAuditLogListIsPartialOnlyNoLayoutWrapper(t *testing.T) {
 		t.Errorf("handleAdminAuditLogList returned full Layout wrapper for non-HTMX request; got <html> in body")
 	}
 }
+
+// ─── Phase 5: LDAP login handler tests (REQ-1, 2, 3, 10, 11, 12, 14, 27) ─────
+
+// newLDAPMux creates a test mux wired for LDAP login mode with the provided callbacks.
+func newLDAPMux(
+	ldapLogin func(ctx context.Context, username, password string) (string, LDAPUserInfo, error),
+	validateToken func(token string) error,
+	createCookie func(w http.ResponseWriter, r *http.Request, jwt string, info LDAPUserInfo) error,
+) *http.ServeMux {
+	mux := http.NewServeMux()
+	Mount(mux, MountConfig{
+		RequireSession: func(r *http.Request) error {
+			// Never already-authed in these tests.
+			return errors.New("not authenticated")
+		},
+		ValidateLoginToken:      validateToken,
+		LDAPLogin:               ldapLogin,
+		CreateLDAPSessionCookie: createCookie,
+		IsAdmin:                 func(_ *http.Request) bool { return false },
+	})
+	return mux
+}
+
+// 5.1 RED: GET /dashboard/login with LDAPLogin set → username+password form, NO token field.
+func TestLDAPLoginPageRenders(t *testing.T) {
+	mux := newLDAPMux(
+		func(_ context.Context, _, _ string) (string, LDAPUserInfo, error) { return "", LDAPUserInfo{}, nil },
+		nil,
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard/login", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="username"`) {
+		t.Errorf("expected name=\"username\" in LDAP login body, got %q", body)
+	}
+	if !strings.Contains(body, `name="password"`) {
+		t.Errorf("expected name=\"password\" in LDAP login body, got %q", body)
+	}
+	if strings.Contains(body, `name="token"`) {
+		t.Errorf("LDAP login page must NOT contain name=\"token\", got %q", body)
+	}
+}
+
+// 5.2 RED: GET /dashboard/login with LDAPLogin nil → token form, NO username.
+func TestTokenLoginPageRenders(t *testing.T) {
+	mux := http.NewServeMux()
+	Mount(mux, MountConfig{
+		RequireSession: func(r *http.Request) error { return errors.New("not authenticated") },
+		// LDAPLogin is nil → token mode
+	})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard/login", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="token"`) {
+		t.Errorf("expected name=\"token\" in token login body, got %q", body)
+	}
+	if strings.Contains(body, `name="username"`) {
+		t.Errorf("token login page must NOT contain name=\"username\", got %q", body)
+	}
+}
+
+// 5.3 RED: GET /dashboard/login?next=/dashboard/projects → hidden next field preserved.
+// next must be a /dashboard/* path — sanitizeDashboardNext rejects other paths.
+func TestLDAPLoginPage_NextField(t *testing.T) {
+	mux := newLDAPMux(
+		func(_ context.Context, _, _ string) (string, LDAPUserInfo, error) { return "", LDAPUserInfo{}, nil },
+		nil,
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/dashboard/login?next=%2Fdashboard%2Fprojects", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `value="/dashboard/projects"`) {
+		t.Errorf("expected value=\"/dashboard/projects\" hidden input in LDAP login, got %q", body)
+	}
+}
+
+// 5.4 RED: POST with empty username → 200 + validation error, LDAPLogin NOT called.
+func TestLDAPLoginSubmit_EmptyUsername(t *testing.T) {
+	callCount := 0
+	mux := newLDAPMux(
+		func(_ context.Context, _, _ string) (string, LDAPUserInfo, error) {
+			callCount++
+			return "", LDAPUserInfo{}, nil
+		},
+		nil,
+		nil,
+	)
+	form := url.Values{"username": {""}, "password": {"secret"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with validation error, got %d", rec.Code)
+	}
+	if callCount != 0 {
+		t.Errorf("LDAPLogin must NOT be called when username is empty, got %d calls", callCount)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "required") {
+		t.Errorf("expected validation error message in body, got %q", body)
+	}
+}
+
+// 5.5 RED: POST with empty password → 200 + validation error, LDAPLogin NOT called.
+func TestLDAPLoginSubmit_EmptyPassword(t *testing.T) {
+	callCount := 0
+	mux := newLDAPMux(
+		func(_ context.Context, _, _ string) (string, LDAPUserInfo, error) {
+			callCount++
+			return "", LDAPUserInfo{}, nil
+		},
+		nil,
+		nil,
+	)
+	form := url.Values{"username": {"alice"}, "password": {""}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with validation error, got %d", rec.Code)
+	}
+	if callCount != 0 {
+		t.Errorf("LDAPLogin must NOT be called when password is empty, got %d calls", callCount)
+	}
+}
+
+// 5.6 RED: LDAPLogin returns error → 200 + "invalid credentials", no cookie.
+func TestLDAPLoginSubmit_BadCredentials(t *testing.T) {
+	mux := newLDAPMux(
+		func(_ context.Context, _, _ string) (string, LDAPUserInfo, error) {
+			return "", LDAPUserInfo{}, errors.New("upstream 401")
+		},
+		nil,
+		nil,
+	)
+	form := url.Values{"username": {"alice"}, "password": {"wrong"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with error form, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "invalid credentials") {
+		t.Errorf("expected \"invalid credentials\" in body, got %q", body)
+	}
+	if len(rec.Result().Cookies()) != 0 {
+		t.Error("expected no cookies on bad credentials")
+	}
+}
+
+// 5.7 RED: LDAPLogin succeeds, ValidateLoginToken succeeds, CreateLDAPSessionCookie
+// called once, response is 303 to /dashboard/.
+func TestLDAPLoginSubmit_Success(t *testing.T) {
+	cookieCalls := 0
+	mux := newLDAPMux(
+		func(_ context.Context, _, _ string) (string, LDAPUserInfo, error) {
+			return "jwt-token", LDAPUserInfo{CN: "Alice"}, nil
+		},
+		func(_ string) error { return nil },
+		func(w http.ResponseWriter, _ *http.Request, _ string, _ LDAPUserInfo) error {
+			cookieCalls++
+			http.SetCookie(w, &http.Cookie{Name: "engram_dashboard_ldap", Value: "session", Path: "/dashboard"})
+			return nil
+		},
+	)
+	form := url.Values{"username": {"alice"}, "password": {"secret"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303, got %d body=%q", rec.Code, rec.Body.String())
+	}
+	if cookieCalls != 1 {
+		t.Errorf("expected CreateLDAPSessionCookie called once, got %d", cookieCalls)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.HasPrefix(loc, "/dashboard/") {
+		t.Errorf("expected redirect to /dashboard/, got %q", loc)
+	}
+}
+
+// 5.8 RED: LDAPLogin ok but ValidateLoginToken fails → 200 + "not authorized", no cookie.
+func TestLDAPLoginSubmit_ValidateTokenFails(t *testing.T) {
+	cookieCalls := 0
+	mux := newLDAPMux(
+		func(_ context.Context, _, _ string) (string, LDAPUserInfo, error) {
+			return "jwt-token", LDAPUserInfo{CN: "Alice"}, nil
+		},
+		func(_ string) error { return errors.New("group not matched") },
+		func(w http.ResponseWriter, _ *http.Request, _ string, _ LDAPUserInfo) error {
+			cookieCalls++
+			return nil
+		},
+	)
+	form := url.Values{"username": {"alice"}, "password": {"secret"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with error, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "not authorized") {
+		t.Errorf("expected \"not authorized\" in body, got %q", body)
+	}
+	if cookieCalls != 0 {
+		t.Errorf("CreateLDAPSessionCookie must NOT be called when ValidateLoginToken fails")
+	}
+}
+
+// 5.9 RED: LDAPLogin nil; POST token → 303 (existing token path regression).
+func TestTokenLoginSubmit_RegressionUnchanged(t *testing.T) {
+	mux := http.NewServeMux()
+	Mount(mux, MountConfig{
+		RequireSession: func(r *http.Request) error { return errors.New("not authenticated") },
+		ValidateLoginToken: func(token string) error {
+			if token == "valid-token" {
+				return nil
+			}
+			return errors.New("invalid")
+		},
+		CreateSessionCookie: func(w http.ResponseWriter, _ *http.Request, _ string) error {
+			http.SetCookie(w, &http.Cookie{Name: "engram_dashboard_token", Value: "session", Path: "/dashboard"})
+			return nil
+		},
+		// LDAPLogin is nil → token path
+	})
+	form := url.Values{"token": {"valid-token"}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 for valid token, got %d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+// REQ-29 / SC-11 RED: POST /dashboard/logout clears the session cookie and
+// redirects to /dashboard/login with 303 See Other.
+func TestLogoutClearsCookieAndRedirects(t *testing.T) {
+	clearCalls := 0
+	mux := http.NewServeMux()
+	Mount(mux, MountConfig{
+		RequireSession: func(r *http.Request) error {
+			if c, err := r.Cookie("engram_dashboard_token"); err == nil && c != nil {
+				return nil
+			}
+			return errUnauthorized
+		},
+		ClearSessionCookie: func(w http.ResponseWriter, _ *http.Request) {
+			clearCalls++
+			http.SetCookie(w, &http.Cookie{Name: "engram_dashboard_token", Value: "", Path: "/dashboard", MaxAge: -1})
+		},
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/logout", nil)
+	req.AddCookie(&http.Cookie{Name: "engram_dashboard_token", Value: "valid-session"})
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 See Other, got %d", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if loc != "/dashboard/login" {
+		t.Errorf("expected Location=/dashboard/login, got %q", loc)
+	}
+	if clearCalls != 1 {
+		t.Errorf("expected ClearSessionCookie called once, got %d", clearCalls)
+	}
+}
+
+// REQ-30 / SC-11 RED: after logout, a GET to a protected route without a
+// session cookie redirects to /dashboard/login (cookie-absent → unauthenticated).
+func TestLogoutPostSessionUnauthenticated(t *testing.T) {
+	mux := http.NewServeMux()
+	Mount(mux, MountConfig{
+		RequireSession: func(r *http.Request) error {
+			if c, err := r.Cookie("engram_dashboard_token"); err == nil && c != nil {
+				return nil
+			}
+			return errUnauthorized
+		},
+		ClearSessionCookie: func(w http.ResponseWriter, _ *http.Request) {
+			http.SetCookie(w, &http.Cookie{Name: "engram_dashboard_token", Value: "", Path: "/dashboard", MaxAge: -1})
+		},
+	})
+
+	// Step 1 — logout clears the cookie (verified by TestLogoutClearsCookieAndRedirects).
+	logoutRec := httptest.NewRecorder()
+	logoutReq := httptest.NewRequest(http.MethodPost, "/dashboard/logout", nil)
+	logoutReq.AddCookie(&http.Cookie{Name: "engram_dashboard_token", Value: "valid-session"})
+	mux.ServeHTTP(logoutRec, logoutReq)
+	if logoutRec.Code != http.StatusSeeOther {
+		t.Fatalf("logout: expected 303, got %d", logoutRec.Code)
+	}
+
+	// Step 2 — subsequent GET to a protected route without any cookie → 303 to login.
+	getRec := httptest.NewRecorder()
+	getReq := httptest.NewRequest(http.MethodGet, "/dashboard/projects", nil)
+	// No cookie attached — simulates the post-logout state.
+	mux.ServeHTTP(getRec, getReq)
+	if getRec.Code != http.StatusSeeOther {
+		t.Fatalf("post-logout GET: expected 303, got %d", getRec.Code)
+	}
+	loc := getRec.Header().Get("Location")
+	if !strings.HasPrefix(loc, "/dashboard/login") {
+		t.Errorf("post-logout GET: expected redirect to /dashboard/login, got %q", loc)
+	}
+}
+
+// 5.11 RED: focused unit test on LDAPLoginPage templ component directly.
+func TestLDAPLoginPageTempl_RenderUsernamePasswordNext(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	if err := LDAPLoginPage("", "/some/next").Render(req.Context(), rec); err != nil {
+		t.Fatalf("LDAPLoginPage render error: %v", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `name="username"`) {
+		t.Errorf("expected name=\"username\" in LDAPLoginPage, got %q", body)
+	}
+	if !strings.Contains(body, `name="password"`) {
+		t.Errorf("expected name=\"password\" in LDAPLoginPage, got %q", body)
+	}
+	if !strings.Contains(body, `name="next"`) {
+		t.Errorf("expected name=\"next\" hidden field in LDAPLoginPage, got %q", body)
+	}
+	if !strings.Contains(body, `value="/some/next"`) {
+		t.Errorf("expected value=\"/some/next\" in LDAPLoginPage, got %q", body)
+	}
+}

@@ -90,15 +90,30 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
 	}
 	cs.SetDashboardAllowedProjects(allowedProjects)
 
+	log.Printf("[engram-cloud] boot: auth_mode=%q", cfg.AuthMode)
 	if cfg.AuthMode == cloud.AuthModeLDAP {
 		groupMap, err := auth.ParseGroupMap(cfg.LDAPGroupMap)
 		if err != nil {
 			_ = cs.Close()
 			return nil, fmt.Errorf("parse ENGRAM_LDAP_GROUP_MAP: %w", err)
 		}
+		log.Printf("[engram-cloud] LDAP boot: auth_url=%q api_key_set=%t group_map_entries=%d", cfg.AuthURL, strings.TrimSpace(cfg.AuthAPIKey) != "", len(groupMap))
 		ldapAuth := auth.NewLDAPAuthorizer(groupMap)
 		loginProxy := auth.NewLoginProxy(cfg.AuthURL, 10*time.Second)
 		loginProxy.APIKey = cfg.AuthAPIKey
+
+		ldapCodec, err := auth.NewLDAPSessionCodec(cfg.JWTSecret)
+		if err != nil {
+			_ = cs.Close()
+			return nil, fmt.Errorf("LDAP session codec: %w", err)
+		}
+
+		limiter := auth.DefaultLimiterFromEnv()
+
+		ldapLoginFunc := func(ctx context.Context, username, password string) (string, auth.UserInfo, error) {
+			return loginProxy.Login(ctx, username, password)
+		}
+
 		return &defaultCloudRuntime{
 			server: cloudserver.New(
 				cs,
@@ -106,6 +121,9 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
 				cfg.Port,
 				cloudserver.WithHost(cfg.BindHost),
 				cloudserver.WithLoginProxy(loginProxy),
+				cloudserver.WithLDAPSessionCodec(ldapCodec),
+				cloudserver.WithLDAPLoginFunc(ldapLoginFunc),
+				cloudserver.WithLDAPLimiter(limiter),
 				cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
 			),
 			store: cs,

@@ -1,8 +1,10 @@
 package cloudserver
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -139,5 +141,80 @@ func TestLDAPModeWildcardClaimAuthorizesAnyProject(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("expected wildcard to authorize %q (got %d body=%q)", project, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 6.5 RED: rate-limiter middleware rejects 2nd call → 429 + Retry-After (REQ-15, REQ-24)
+// ---------------------------------------------------------------------------
+
+// countingLimiter allows exactly maxAllowed calls, then denies.
+type countingLimiter struct {
+	maxAllowed int
+	calls      int
+}
+
+func (l *countingLimiter) Allow(_ string) bool {
+	l.calls++
+	return l.calls <= l.maxAllowed
+}
+
+func TestWithLDAPLoginFunc_RateLimitMiddleware(t *testing.T) {
+	loginCallCount := 0
+	loginFn := func(_ context.Context, _, _ string) (string, cloudauth.UserInfo, error) {
+		loginCallCount++
+		expUnix := time.Now().Add(3600 * time.Second).Unix()
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"sub": "alice",
+			"exp": float64(expUnix),
+		})
+		signed, _ := tok.SignedString([]byte("test-key-decoded-only-by-engram"))
+		return signed, cloudauth.UserInfo{CN: "Alice"}, nil
+	}
+
+	limiter := &countingLimiter{maxAllowed: 1} // allow 1st call, deny 2nd
+
+	realCodec, err := cloudauth.NewLDAPSessionCodec("test-ldap-secret-for-cs")
+	if err != nil {
+		t.Fatalf("NewLDAPSessionCodec: %v", err)
+	}
+
+	srv := New(&fakeStore{}, fakeAuth{}, 0,
+		WithLDAPSessionCodec(realCodec),
+		WithLDAPLoginFunc(loginFn),
+		WithLDAPLimiter(limiter),
+	)
+
+	postLogin := func() *httptest.ResponseRecorder {
+		form := url.Values{}
+		form.Set("username", "alice")
+		form.Set("password", "s3cret")
+		req := httptest.NewRequest(http.MethodPost, "/dashboard/login", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1st call: allowed (limiter.Allow returns true).
+	rec1 := postLogin()
+	if rec1.Code == http.StatusTooManyRequests {
+		t.Fatalf("expected 1st call to succeed, got 429")
+	}
+
+	// 2nd call: rate-limited → 429.
+	rec2 := postLogin()
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on 2nd call, got %d body=%q", rec2.Code, rec2.Body.String())
+	}
+	if rec2.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected Retry-After header on 429, got none")
+	}
+
+	// LDAPLogin callback must NOT have been invoked on the 2nd call.
+	// After 1st call loginCallCount == 1 (first succeeded). After 2nd call it
+	// must still be 1 if rate limiting blocked before calling the login fn.
+	if loginCallCount != 1 {
+		t.Fatalf("expected LDAPLogin called exactly once (blocked on 2nd), got %d", loginCallCount)
 	}
 }

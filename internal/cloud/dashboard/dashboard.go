@@ -38,6 +38,15 @@ type staticSyncStatusProvider struct {
 
 func (s staticSyncStatusProvider) Status() SyncStatus { return s.status }
 
+// ErrLDAPJWTInvalid is returned by CreateLDAPSessionCookie when the upstream
+// JWT is invalid (e.g. missing or expired exp claim). The dashboard handler
+// re-renders the login form with an appropriate error rather than returning 500.
+//
+// Callers (typically the cloudserver wiring closure) should wrap jwt_exp errors
+// using fmt.Errorf("...: %w", ErrLDAPJWTInvalid) or return ErrLDAPJWTInvalid
+// directly.
+var ErrLDAPJWTInvalid = errors.New("dashboard: upstream JWT is invalid or expired")
+
 type MountConfig struct {
 	RequireSession      func(r *http.Request) error
 	ValidateLoginToken  func(token string) error
@@ -48,6 +57,14 @@ type MountConfig struct {
 	Store               DashboardStore
 	MaxLoginBodyBytes   int64
 	StatusProvider      SyncStatusProvider
+
+	// LDAP login mode. When non-nil, the login page renders username+password
+	// fields instead of the token-paste field (REQ-1, REQ-2).
+	LDAPLogin func(ctx context.Context, username, password string) (jwt string, info LDAPUserInfo, err error)
+
+	// CreateLDAPSessionCookie is called on successful LDAP login to mint and
+	// store the signed dashboard session cookie (REQ-11).
+	CreateLDAPSessionCookie func(w http.ResponseWriter, r *http.Request, jwt string, info LDAPUserInfo) error
 }
 
 type DashboardStore interface {
@@ -237,6 +254,10 @@ func (h *handlers) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if h.cfg.LDAPLogin != nil {
+		renderComponent(w, r, LDAPLoginPage("", next))
+		return
+	}
 	renderComponent(w, r, LoginPage("", next))
 }
 
@@ -253,11 +274,19 @@ func (h *handlers) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid form payload", http.StatusBadRequest)
 		return
 	}
-	token := strings.TrimSpace(r.PostForm.Get("token"))
 	next := sanitizeDashboardNext(r.PostForm.Get("next"))
 	if next == "" {
 		next = sanitizeDashboardNext(r.URL.Query().Get("next"))
 	}
+
+	// Route to LDAP handler when LDAP login is configured (REQ-1).
+	if h.cfg.LDAPLogin != nil {
+		h.handleLDAPLoginSubmit(w, r, next)
+		return
+	}
+
+	// Token-paste path (unchanged, REQ-27).
+	token := strings.TrimSpace(r.PostForm.Get("token"))
 	if h.cfg.RequireSession != nil {
 		if err := h.cfg.RequireSession(r); err == nil {
 			http.Redirect(w, r, dashboardPostLoginPath(next), http.StatusSeeOther)
@@ -281,6 +310,58 @@ func (h *handlers) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	http.Redirect(w, r, dashboardPostLoginPath(next), http.StatusSeeOther)
+}
+
+// handleLDAPLoginSubmit handles POST /dashboard/login in LDAP mode (REQ-11, REQ-14).
+func (h *handlers) handleLDAPLoginSubmit(w http.ResponseWriter, r *http.Request, next string) {
+	username := strings.TrimSpace(r.PostForm.Get("username"))
+	password := strings.TrimSpace(r.PostForm.Get("password"))
+
+	if username == "" || password == "" {
+		renderComponent(w, r, LDAPLoginPage("username and password are required", next))
+		return
+	}
+
+	if h.cfg.RequireSession != nil {
+		if err := h.cfg.RequireSession(r); err == nil {
+			http.Redirect(w, r, dashboardPostLoginPath(next), http.StatusSeeOther)
+			return
+		}
+	}
+
+	jwt, info, err := h.cfg.LDAPLogin(r.Context(), username, password)
+	if err != nil {
+		log.Printf("[dashboard][ldap-login] LDAPLogin failed for username=%q: %v", username, err)
+		renderComponent(w, r, LDAPLoginPage("invalid credentials", next))
+		return
+	}
+	log.Printf("[dashboard][ldap-login] LDAPLogin succeeded username=%q jwt_len=%d info.uid=%q info.cn=%q", username, len(jwt), info.UID, info.CN)
+
+	if h.cfg.ValidateLoginToken != nil {
+		if err := h.cfg.ValidateLoginToken(jwt); err != nil {
+			log.Printf("[dashboard][ldap-login] ValidateLoginToken rejected username=%q: %v", username, err)
+			renderComponent(w, r, LDAPLoginPage("account not authorized for this workspace", next))
+			return
+		}
+	}
+
+	log.Printf("[dashboard][ldap-login] ValidateLoginToken passed username=%q", username)
+	if h.cfg.CreateLDAPSessionCookie != nil {
+		if err := h.cfg.CreateLDAPSessionCookie(w, r, jwt, info); err != nil {
+			log.Printf("[dashboard][ldap-login] CreateLDAPSessionCookie failed username=%q: %v", username, err)
+			if errors.Is(err, ErrLDAPJWTInvalid) {
+				// JWT was missing exp or already expired — re-render form with error.
+				renderComponent(w, r, LDAPLoginPage("session token is invalid or expired", next))
+				return
+			}
+			http.Error(w, "unable to create dashboard session", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	target := dashboardPostLoginPath(next)
+	log.Printf("[dashboard][ldap-login] redirecting username=%q to=%q", username, target)
+	http.Redirect(w, r, target, http.StatusSeeOther)
 }
 
 func (h *handlers) handleLogout(w http.ResponseWriter, r *http.Request) {
