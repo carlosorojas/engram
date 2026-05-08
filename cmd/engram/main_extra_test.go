@@ -1490,7 +1490,11 @@ func TestResolveCloudRuntimeConfigReturnsErrorWhenPersistedConfigUnreadable(t *t
 	}
 }
 
-func TestResolveCloudRuntimeConfigIgnoresPersistedTokenWithoutEnvOverride(t *testing.T) {
+// TestResolveCloudRuntimeConfigUsesPersistedTokenAsFallback verifies the token
+// resolution order introduced for LDAP login support: when ENGRAM_CLOUD_TOKEN
+// is unset, the token persisted in cloud.json is used as-is (fallback path).
+// This replaces the old "token ignored" test that was wrong after the fix.
+func TestResolveCloudRuntimeConfigUsesPersistedTokenAsFallback(t *testing.T) {
 	cfg := testConfig(t)
 	if err := saveCloudConfig(cfg, &cloudConfig{ServerURL: "https://cloud.example.test", Token: "legacy-token"}); err != nil {
 		t.Fatalf("save cloud config: %v", err)
@@ -1504,8 +1508,9 @@ func TestResolveCloudRuntimeConfigIgnoresPersistedTokenWithoutEnvOverride(t *tes
 	if runtimeCfg == nil {
 		t.Fatal("expected non-nil cloud runtime config")
 	}
-	if runtimeCfg.Token != "" {
-		t.Fatalf("expected persisted legacy token to be ignored, got %q", runtimeCfg.Token)
+	// Persisted token is kept as the fallback when env override is absent.
+	if runtimeCfg.Token != "legacy-token" {
+		t.Fatalf("expected persisted token as fallback, got %q", runtimeCfg.Token)
 	}
 	if runtimeCfg.ServerURL != "https://cloud.example.test" {
 		t.Fatalf("expected server URL to remain available, got %q", runtimeCfg.ServerURL)
