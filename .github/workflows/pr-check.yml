@@ -12,7 +12,19 @@ jobs:
       - name: Verify PR links an issue
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            // Skip when the repo has issues disabled (typical for private/working
+            // forks that don't track issues here).
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            if (!repo.has_issues) {
+              core.info(`⏭️  Issues are disabled on ${context.repo.owner}/${context.repo.repo}; skipping issue-reference check.`);
+              return;
+            }
+
             const body = context.payload.pull_request.body || '';
             const issuePattern = /(?:closes|fixes|resolves)\s+#(\d+)/gi;
             const matches = [...body.matchAll(issuePattern)];
@@ -38,6 +50,16 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            // Skip when the repo has issues disabled.
+            const { data: repo } = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            if (!repo.has_issues) {
+              core.info(`⏭️  Issues are disabled on ${context.repo.owner}/${context.repo.repo}; skipping issue-approval check.`);
+              return;
+            }
+
             const body = context.payload.pull_request.body || '';
             const issuePattern = /(?:closes|fixes|resolves)\s+#(\d+)/gi;
             const matches = [...body.matchAll(issuePattern)];
