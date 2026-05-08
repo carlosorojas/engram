@@ -15,15 +15,18 @@ import (
 	"golang.org/x/term"
 )
 
-// runLDAPLogin POSTs the credentials to the upstream login URL and persists
-// the returned JWT to cloud.json:Token. The function is the testable core of
-// `engram cloud login --ldap`; the interactive prompt lives in cmdCloudLogin.
+// runLDAPLogin POSTs the credentials to <baseURL>/auth/ldap/login and persists
+// the cloud server BASE URL plus the returned JWT to cloud.json. The cloud
+// server base is what subsequent commands (sync, status) need to reach
+// non-auth endpoints — the login path is a single endpoint among many.
 //
 // Contract with the 3rd-party auth service (confirmed):
 //   - request:  {"username":"...","password":"..."}
 //   - success:  {"status":"Login successful","token":"<jwt>"} (2xx)
 //   - failure:  {"error":"..."} with non-2xx status
-func runLDAPLogin(cfg store.Config, loginURL, username, password string) error {
+func runLDAPLogin(cfg store.Config, baseURL, username, password string) error {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	loginURL := baseURL + "/auth/ldap/login"
 	body, err := json.Marshal(map[string]string{
 		"username": username,
 		"password": password,
@@ -78,7 +81,7 @@ func runLDAPLogin(cfg store.Config, loginURL, username, password string) error {
 		return fmt.Errorf("auth response missing token field")
 	}
 
-	cc := &cloudConfig{ServerURL: loginURL, Token: token}
+	cc := &cloudConfig{ServerURL: baseURL, Token: token}
 	if err := saveCloudConfig(cfg, cc); err != nil {
 		return fmt.Errorf("persist cloud config: %w", err)
 	}
@@ -132,8 +135,6 @@ func cmdCloudLogin(cfg store.Config) {
 		return
 	}
 
-	loginURL := strings.TrimRight(serverURL, "/") + "/auth/ldap/login"
-
 	username, err := promptUsername()
 	if err != nil {
 		fatal(err)
@@ -145,7 +146,7 @@ func cmdCloudLogin(cfg store.Config) {
 		return
 	}
 
-	if err := runLDAPLogin(cfg, loginURL, username, password); err != nil {
+	if err := runLDAPLogin(cfg, serverURL, username, password); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		exitFunc(1)
 		return
