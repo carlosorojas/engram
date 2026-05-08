@@ -445,9 +445,11 @@ func resolveCloudRuntimeConfig(cfg store.Config) (*cloudConfig, error) {
 	if cc == nil {
 		cc = &cloudConfig{}
 	}
-	// Legacy persisted tokens in cloud.json are intentionally ignored at runtime.
-	// Runtime auth must come from ENGRAM_CLOUD_TOKEN.
-	cc.Token = ""
+	// Token resolution order:
+	//   1. ENGRAM_CLOUD_TOKEN env var (explicit override, e.g. CI/static-token mode)
+	//   2. Persisted token from cloud.json (written by `engram cloud login --ldap`)
+	// If neither is set, cc.Token stays empty and downstream auth will reject.
+	cc.Token = strings.TrimSpace(cc.Token)
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_SERVER")); v != "" {
 		cc.ServerURL = v
 	}
