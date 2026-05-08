@@ -84,7 +84,7 @@ func TestCloudServeLDAPModeEndToEnd(t *testing.T) {
 	// --- 4. Drive the runLDAPLogin core (exactly what `engram cloud login --ldap`
 	//        runs after collecting credentials). -----------------------------
 	cfg := newTestCfgWithDataDir(t)
-	if err := runLDAPLogin(cfg, frontend.URL+"/auth/ldap/login", "alice", "any"); err != nil {
+	if err := runLDAPLogin(cfg, frontend.URL, "alice", "any"); err != nil {
 		t.Fatalf("login flow failed: %v", err)
 	}
 	if upstreamHits != 1 {
@@ -123,7 +123,7 @@ func TestCloudServeLDAPModeEndToEnd(t *testing.T) {
 
 	// --- 7. Upstream rejects bad creds → CLI surfaces the error. ------------
 	cfg2 := newTestCfgWithDataDir(t)
-	if err := runLDAPLogin(cfg2, frontend.URL+"/auth/ldap/login", "ghost", "any"); err == nil {
+	if err := runLDAPLogin(cfg2, frontend.URL, "ghost", "any"); err == nil {
 		t.Fatal("expected login failure for unknown user")
 	} else if !strings.Contains(err.Error(), "unknown user") {
 		t.Fatalf("expected upstream error surfaced, got %q", err.Error())
