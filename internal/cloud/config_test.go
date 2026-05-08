@@ -263,6 +263,66 @@ func TestConfigFromEnvLDAPGroupMap(t *testing.T) {
 	})
 }
 
+func TestConfigFromEnvLDAPAdminGroups(t *testing.T) {
+	t.Run("unset defaults to empty slice", func(t *testing.T) {
+		t.Setenv("ENGRAM_LDAP_ADMIN_GROUPS", "")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.LDAPAdminGroups) != 0 {
+			t.Fatalf("expected empty LDAPAdminGroups, got %v", cfg.LDAPAdminGroups)
+		}
+	})
+
+	t.Run("single group parsed", func(t *testing.T) {
+		t.Setenv("ENGRAM_LDAP_ADMIN_GROUPS", "admins")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.LDAPAdminGroups) != 1 || cfg.LDAPAdminGroups[0] != "admins" {
+			t.Fatalf("expected [admins], got %v", cfg.LDAPAdminGroups)
+		}
+	})
+
+	t.Run("comma-separated groups parsed and whitespace trimmed", func(t *testing.T) {
+		t.Setenv("ENGRAM_LDAP_ADMIN_GROUPS", " ops-admins , cloud-ops , ")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.LDAPAdminGroups) != 2 {
+			t.Fatalf("expected 2 groups, got %v", cfg.LDAPAdminGroups)
+		}
+		if cfg.LDAPAdminGroups[0] != "ops-admins" || cfg.LDAPAdminGroups[1] != "cloud-ops" {
+			t.Fatalf("unexpected group values: %v", cfg.LDAPAdminGroups)
+		}
+	})
+
+	t.Run("case is preserved (case-sensitive)", func(t *testing.T) {
+		t.Setenv("ENGRAM_LDAP_ADMIN_GROUPS", "OPS-Admins,cloud-OPS")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.LDAPAdminGroups[0] != "OPS-Admins" || cfg.LDAPAdminGroups[1] != "cloud-OPS" {
+			t.Fatalf("expected case-preserved groups, got %v", cfg.LDAPAdminGroups)
+		}
+	})
+
+	t.Run("empty entries dropped", func(t *testing.T) {
+		t.Setenv("ENGRAM_LDAP_ADMIN_GROUPS", ",admins,,")
+		cfg, err := ConfigFromEnv()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(cfg.LDAPAdminGroups) != 1 || cfg.LDAPAdminGroups[0] != "admins" {
+			t.Fatalf("expected [admins] after dropping empties, got %v", cfg.LDAPAdminGroups)
+		}
+	})
+}
+
 func TestIsDefaultJWTSecret(t *testing.T) {
 	t.Run("default secret returns true", func(t *testing.T) {
 		if !IsDefaultJWTSecret(DefaultJWTSecret) {

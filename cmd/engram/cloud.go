@@ -124,6 +124,7 @@ var newCloudRuntime = func(cfg cloud.Config) (cloudServerRuntime, error) {
 				cloudserver.WithLDAPSessionCodec(ldapCodec),
 				cloudserver.WithLDAPLoginFunc(ldapLoginFunc),
 				cloudserver.WithLDAPLimiter(limiter),
+				cloudserver.WithLDAPAdminGroups(cfg.LDAPAdminGroups),
 				cloudserver.WithSyncStatusProvider(cloudDashboardStatusProvider{store: cs, projects: allowedProjects}),
 			),
 			store: cs,

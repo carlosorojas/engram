@@ -21,6 +21,16 @@ set -eu
 #   ENGRAM_LDAP_GROUP_MAP    required — group→projects map
 #                            format: "group1:projA,projB;group2:projC"
 #                            "*" wildcard project grants all projects
+#   ENGRAM_LDAP_ADMIN_GROUPS optional — comma-separated LDAP group names whose
+#                            members get dashboard admin access
+#                            (e.g. "ops-admins,cloud-ops")
+#                            empty/unset → no admins by group
+#   ENGRAM_LDAP_LOGIN_RATE_LIMIT
+#                            optional — max login attempts per IP per window
+#                            (default: 10)
+#   ENGRAM_LDAP_LOGIN_RATE_WINDOW_SECONDS
+#                            optional — sliding window length in seconds
+#                            (default: 60)
 #   ENGRAM_CLOUD_TOKEN       MUST be unset in ldap mode
 #
 # Common:
