@@ -22,6 +22,7 @@ type Config struct {
 	AuthURL         string
 	AuthAPIKey      string
 	LDAPGroupMap    string
+	LDAPAdminGroups []string
 }
 
 const DefaultJWTSecret = "engram-dev-jwt-secret-for-local-smoke-1234"
@@ -86,6 +87,18 @@ func ConfigFromEnv() (Config, error) {
 	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_LDAP_GROUP_MAP")); v != "" {
 		cfg.LDAPGroupMap = v
+	}
+	if v := strings.TrimSpace(os.Getenv("ENGRAM_LDAP_ADMIN_GROUPS")); v != "" {
+		parts := strings.Split(v, ",")
+		groups := make([]string, 0, len(parts))
+		for _, part := range parts {
+			g := strings.TrimSpace(part)
+			if g == "" {
+				continue
+			}
+			groups = append(groups, g)
+		}
+		cfg.LDAPAdminGroups = groups
 	}
 	if v := strings.TrimSpace(os.Getenv("ENGRAM_CLOUD_ALLOWED_PROJECTS")); v != "" {
 		parts := strings.Split(v, ",")

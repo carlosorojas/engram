@@ -83,10 +83,13 @@ type CloudServer struct {
 	syncStatus     dashboard.SyncStatusProvider
 	listenAndServe func(addr string, handler http.Handler) error
 
-	// LDAP dashboard session fields.
+	// LDAP dashboard session fields (Phase 6).
 	ldapCodec     ldapDashboardSessionCodec
 	ldapLimiter   cloudauth.Limiter
 	ldapLoginFunc func(ctx context.Context, user, pass string) (jwt string, info cloudauth.UserInfo, err error)
+
+	// LDAP admin group authorization (Phase 9).
+	ldapAdminGroups []string
 }
 
 const defaultHost = "127.0.0.1"
@@ -144,6 +147,17 @@ func WithLDAPSessionCodec(codec ldapDashboardSessionCodec) Option {
 func WithLDAPLoginFunc(fn func(ctx context.Context, user, pass string) (jwt string, info cloudauth.UserInfo, err error)) Option {
 	return func(s *CloudServer) {
 		s.ldapLoginFunc = fn
+	}
+}
+
+// WithLDAPAdminGroups sets the LDAP group names that grant dashboard admin
+// access. A user is considered a dashboard admin iff at least one of their JWT
+// groups claim values appears in this list. Comparison is case-sensitive.
+// When empty or unset, LDAP group-based admin access is disabled (the static
+// dashboardAdmin token path remains unaffected).
+func WithLDAPAdminGroups(groups []string) Option {
+	return func(s *CloudServer) {
+		s.ldapAdminGroups = groups
 	}
 }
 
@@ -515,6 +529,22 @@ func (s *CloudServer) isDashboardAdmin(r *http.Request) bool {
 	if s.auth == nil {
 		return false
 	}
+
+	// LDAP mode: group-based admin check takes precedence when an ldapCodec is
+	// wired and admin groups are configured.
+	if s.ldapCodec != nil && len(s.ldapAdminGroups) > 0 {
+		cookie, err := r.Cookie(dashboardSessionCookieName)
+		if err != nil {
+			return false
+		}
+		rawJWT, _, err := s.ldapCodec.ParseDashboardSession(cookie.Value)
+		if err != nil {
+			return false
+		}
+		return cloudauth.IsAdminJWT(rawJWT, s.ldapAdminGroups)
+	}
+
+	// Token mode: static admin token comparison (original logic).
 	adminToken := strings.TrimSpace(s.dashboardAdmin)
 	if adminToken == "" {
 		return false
