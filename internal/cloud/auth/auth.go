@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -21,18 +22,46 @@ var ErrBearerTokenNotConfigured = errors.New("cloud bearer token is not configur
 var ErrInvalidDashboardSessionToken = errors.New("invalid dashboard session token")
 var ErrProjectNotAllowed = errors.New("project is not allowed for this token")
 
+// ctxKey is a private type used to namespace context keys owned by this package.
+// Keeping the type unexported prevents external packages from minting collisions.
+type ctxKey int
+
+const requestAuthorizerKey ctxKey = iota
+
+// WithRequestAuthorizer returns a copy of ctx that carries the given
+// per-request ProjectScopeAuthorizer. The cloud server reads this in the
+// project-check site so LDAP-mode requests use a user-scoped allowlist
+// instead of the process-global one.
+func WithRequestAuthorizer(ctx context.Context, authz *ProjectScopeAuthorizer) context.Context {
+	return context.WithValue(ctx, requestAuthorizerKey, authz)
+}
+
+// RequestAuthorizerFromContext returns the per-request authorizer attached by
+// WithRequestAuthorizer, or (nil, false) when none is present (token mode).
+func RequestAuthorizerFromContext(ctx context.Context) (*ProjectScopeAuthorizer, bool) {
+	authz, ok := ctx.Value(requestAuthorizerKey).(*ProjectScopeAuthorizer)
+	return authz, ok
+}
+
 type Service struct {
 	store         *cloudstore.CloudStore
 	expectedToken string
 	dashboardAuth map[string]struct{}
 	allowed       map[string]struct{}
+	allowAll      bool
 	jwtSecret     []byte
 	now           func() time.Time
 }
 
 type ProjectScopeAuthorizer struct {
-	allowed map[string]struct{}
+	allowed  map[string]struct{}
+	allowAll bool
 }
+
+// WildcardProject is the sentinel value in the allowlist that authorizes every
+// project. Useful for single-tenant deployments or local dev where explicit
+// enumeration adds friction without security benefit.
+const WildcardProject = "*"
 
 func NewService(store *cloudstore.CloudStore, jwtSecret string) (*Service, error) {
 	if len(jwtSecret) < 32 {
@@ -153,7 +182,12 @@ func (s *Service) SetDashboardSessionTokens(tokens []string) {
 
 func (s *Service) SetAllowedProjects(projects []string) {
 	s.allowed = make(map[string]struct{})
+	s.allowAll = false
 	for _, project := range projects {
+		if strings.TrimSpace(project) == WildcardProject {
+			s.allowAll = true
+			continue
+		}
 		normalized, _ := store.NormalizeProject(project)
 		normalized = strings.TrimSpace(normalized)
 		if normalized == "" {
@@ -164,7 +198,7 @@ func (s *Service) SetAllowedProjects(projects []string) {
 }
 
 func (s *Service) AuthorizeProject(project string) error {
-	return authorizeProjectAgainstAllowlist(project, s.allowed)
+	return authorizeProjectAgainstAllowlist(project, s.allowed, s.allowAll)
 }
 
 // EnrolledProjects returns the sorted list of projects that this Service is
@@ -174,12 +208,20 @@ func (s *Service) AuthorizeProject(project string) error {
 // The interface is cloudserver.EnrolledProjectsProvider; this method makes
 // *Service satisfy it without importing cloudserver (structural assertion).
 func (s *Service) EnrolledProjects() []string {
+	if s.allowAll {
+		return nil
+	}
 	return sortedAllowlist(s.allowed)
 }
 
 func (a *ProjectScopeAuthorizer) SetAllowedProjects(projects []string) {
 	a.allowed = make(map[string]struct{})
+	a.allowAll = false
 	for _, project := range projects {
+		if strings.TrimSpace(project) == WildcardProject {
+			a.allowAll = true
+			continue
+		}
 		normalized, _ := store.NormalizeProject(project)
 		normalized = strings.TrimSpace(normalized)
 		if normalized == "" {
@@ -190,7 +232,7 @@ func (a *ProjectScopeAuthorizer) SetAllowedProjects(projects []string) {
 }
 
 func (a *ProjectScopeAuthorizer) AuthorizeProject(project string) error {
-	return authorizeProjectAgainstAllowlist(project, a.allowed)
+	return authorizeProjectAgainstAllowlist(project, a.allowed, a.allowAll)
 }
 
 // EnrolledProjects returns the sorted list of projects this authorizer allows.
@@ -198,6 +240,9 @@ func (a *ProjectScopeAuthorizer) AuthorizeProject(project string) error {
 // can filter server-side by the caller's enrolled projects (REQ-202) rather
 // than fail-closing to an empty result set.
 func (a *ProjectScopeAuthorizer) EnrolledProjects() []string {
+	if a.allowAll {
+		return nil
+	}
 	return sortedAllowlist(a.allowed)
 }
 
@@ -216,14 +261,17 @@ func sortedAllowlist(allowed map[string]struct{}) []string {
 	return out
 }
 
-func authorizeProjectAgainstAllowlist(project string, allowed map[string]struct{}) error {
-	if len(allowed) == 0 {
+func authorizeProjectAgainstAllowlist(project string, allowed map[string]struct{}, allowAll bool) error {
+	if !allowAll && len(allowed) == 0 {
 		return fmt.Errorf("cloud project allowlist is not configured")
 	}
 	normalized, _ := store.NormalizeProject(project)
 	normalized = strings.TrimSpace(normalized)
 	if normalized == "" {
 		return fmt.Errorf("project is required")
+	}
+	if allowAll {
+		return nil
 	}
 	if _, ok := allowed[normalized]; ok {
 		return nil
